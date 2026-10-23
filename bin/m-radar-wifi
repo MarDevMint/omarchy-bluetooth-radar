@@ -1,0 +1,114 @@
+#!/usr/bin/env -S python3 -I
+"""m-radar-wifi - list the Wi-Fi networks around, once, as JSON.
+
+Usage: M_RADAR_SALT=<salt> m-radar-wifi   (or, for testing, m-radar-wifi <salt>)
+
+Asks NetworkManager (nmcli, no root) for the networks it can hear and
+prints one line:
+
+  {"networks": [{"id", "ssid", "channel", "band", "signal", "security",
+                 "inUse", "vendor"}, ...]}
+
+The access point's hardware address never leaves this process: it becomes
+an id hashed with the caller's per-session salt (stable while the radar
+runs, meaningless after), and its first half names the maker from the IEEE
+registry in /usr/share/hwdata/oui.txt when it is a real, fixed address.
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+OUI_FILE = "/usr/share/hwdata/oui.txt"
+FIELDS = "SSID,BSSID,CHAN,FREQ,SIGNAL,SECURITY,IN-USE"
+
+
+def split_terse(line):
+    """nmcli -t separates fields with ':' and escapes literal ones as '\\:'."""
+    return [part.replace("\\:", ":").replace("\\\\", "\\")
+            for part in re.split(r"(?<!\\):", line)]
+
+
+def band(freq_mhz):
+    if freq_mhz >= 5925:
+        return "6 GHz"
+    if freq_mhz >= 4900:
+        return "5 GHz"
+    return "2.4 GHz"
+
+
+def is_fixed(bssid):
+    # The second-lowest bit of the first byte marks a locally administered
+    # (made-up or randomised) address, which has no registered maker.
+    return not int(bssid.split(":")[0], 16) & 0x02
+
+
+def vendors_for(prefixes):
+    """Look up only the prefixes we need in the IEEE list (one pass)."""
+    wanted = {p.replace(":", "") for p in prefixes}
+    found = {}
+    if not wanted:
+        return found
+    try:
+        with open(OUI_FILE, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # "286C07     (base 16)		XIAOMI Electronics,CO.,LTD"
+                if "(base 16)" in line:
+                    prefix = line[:6]
+                    if prefix in wanted:
+                        found[prefix] = line.split("(base 16)", 1)[1].strip()
+                        if len(found) == len(wanted):
+                            break
+    except OSError:
+        pass
+    return found
+
+
+def main():
+    # The salt comes in the environment: argv is readable by every local user.
+    salt = os.environ.get("M_RADAR_SALT") or (sys.argv[1] if len(sys.argv) == 2 else "")
+    if not salt:
+        print(json.dumps({"error": "usage: M_RADAR_SALT=<salt> m-radar-wifi"}))
+        return 2
+    salt = salt.encode()
+    try:
+        out = subprocess.run(
+            ["nmcli", "-t", "-f", FIELDS, "dev", "wifi", "list", "--rescan", "auto"],
+            capture_output=True, text=True, timeout=20, check=True).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        print(json.dumps({"error": "nmcli failed: " + str(e)[:200]}))
+        return 1
+
+    rows = []
+    for line in out.splitlines():
+        parts = split_terse(line)
+        if len(parts) != 7:
+            continue
+        ssid, bssid, chan, freq, signal, security, in_use = parts
+        if not re.fullmatch(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", bssid):
+            continue
+        rows.append((ssid, bssid.upper(), chan, freq, signal, security, in_use))
+
+    makers = vendors_for(b[:8] for _, b, *_ in rows if is_fixed(b))
+    networks = []
+    for ssid, bssid, chan, freq, signal, security, in_use in rows:
+        freq_mhz = int(re.sub(r"\D", "", freq) or 0)
+        networks.append({
+            "id": hashlib.sha256(salt + bssid.encode()).hexdigest()[:12],
+            "ssid": ssid,
+            "channel": int(chan) if chan.isdigit() else 0,
+            "band": band(freq_mhz),
+            "signal": int(signal) if signal.isdigit() else 0,
+            "security": security.strip() or "Open",
+            "inUse": in_use.strip() == "*",
+            "vendor": makers.get(bssid[:8].replace(":", ""), "") if is_fixed(bssid) else "",
+        })
+    print(json.dumps({"networks": networks}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

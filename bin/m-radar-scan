@@ -1,0 +1,548 @@
+#!/usr/bin/env -S python3 -I
+"""m-radar-scan - listen for Bluetooth LE adverts and print what is around.
+
+Asks BlueZ (over D-Bus, no root) for an LE-only scan that reports every
+advert, then prints one JSON snapshot per second on stdout:
+
+  {"powered": true, "scanning": true, "devices": [ {...}, ... ]}
+
+Each device in a snapshot carries what was heard of it in that second: "rssi"
+is the median of the readings, "peak" the strongest, "n" how many there were
+(0 = silent this second, "rssi" is then the last reading), and "age" seconds
+since it was last heard at all. A device silent for LOST_AFTER seconds leaves
+the snapshot; until then its last reading stands and the UI fades it.
+
+Each device is anonymised with a per-run salt, so no real address ever
+leaves this process and nothing is written to disk. It never connects to a
+device. If the adapter was off it is switched on for the scan and switched
+back off on exit. When this process exits, BlueZ ends the scan on its own,
+because a discovery session belongs to the D-Bus client that started it.
+
+Classic Bluetooth (BR/EDR) devices answer an inquiry instead of advertising,
+and only while they are discoverable. Start with --classic, or send
+"classic on" / "classic off" on stdin at any time, to listen for them too.
+Classic scanning shares the radio with Bluetooth audio, so it is opt-in.
+
+The controller itself drops repeat adverts from a device within one scan
+(the kernel's discovery runs 10.24 s), so left alone a device is heard about
+every 10 s. Restarting the scan resets that filter: every RESTART_MS for the
+census (typical gap measured at ~3 s instead of ~10 s, nothing missed), and
+every second after "fast on" on stdin, for following one device.
+
+Putting the power back must survive this process being killed too:
+- if the shell dies, the kernel sends us SIGTERM (PR_SET_PDEATHSIG);
+- while we hold the adapter on, a marker file sits in $XDG_RUNTIME_DIR
+  (tmpfs, gone at reboot). A later run, or `m-radar-scan --restore` which
+  the plugin calls when it loads, finds it and switches Bluetooth back off.
+
+"Off" comes in two flavours. Omarchy turns Bluetooth off with an rfkill soft
+block (omarchy-bluetooth-power), which BlueZ cannot override; the block is
+lifted for the scan and put back after. A plain powered-down adapter is
+powered up and down again instead. The marker remembers which it was.
+"""
+
+import ctypes
+import hashlib
+import json
+import os
+import signal
+import statistics
+import subprocess
+import sys
+import time
+
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+try:
+    from gi.repository import GLibUnix
+    signal_add = GLibUnix.signal_add
+except ImportError:  # older PyGObject
+    signal_add = GLib.unix_signal_add
+
+BLUEZ = "org.bluez"
+ADAPTER = "org.bluez.Adapter1"
+DEVICE = "org.bluez.Device1"
+PROPS = "org.freedesktop.DBus.Properties"
+OBJECTS = "org.freedesktop.DBus.ObjectManager"
+
+def session_salt():
+    """$M_RADAR_SALT (hex) keeps ids stable across runs of one shell session
+    (Guard's short bursts); without it every run gets its own. It comes in the
+    environment because argv is readable by every local user."""
+    try:
+        return bytes.fromhex(os.environ.get("M_RADAR_SALT", ""))  or os.urandom(16)
+    except ValueError:
+        return os.urandom(16)
+
+
+SALT = session_salt()
+
+
+def lasting_salt():
+    """A salt kept across sessions (0600, in $XDG_STATE_HOME), only for "pkey":
+    the one id that can be remembered, so proximity lock knows your own phone
+    tomorrow. Only a hash of the address is ever stored, never the address."""
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    path = os.path.join(state, "m-radar", "salt")
+    try:
+        with open(path, "rb") as f:
+            salt = f.read()
+        if len(salt) == 16:
+            return salt
+    except OSError:
+        pass
+    salt = os.urandom(16)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(salt)
+    except OSError:
+        return None
+    return salt
+
+
+LASTING_SALT = lasting_salt()
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "")
+MARKER = os.path.join(RUNTIME, "m-radar", "powered-on") if RUNTIME else ""
+PR_SET_PDEATHSIG = 1
+RFKILL = "/usr/bin/rfkill"
+# Heard nothing for this long: gone. With the restarts a device that is here
+# comes through every ~3 s (90 % within 7 s), so 12 s means it left.
+LOST_AFTER = 12
+# BlueZ's stand-ins for "no reading".
+NO_RSSI = (0, 127)
+
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+bus = dbus.SystemBus()
+loop = GLib.MainLoop()
+devices = {}  # object path -> Device1 properties
+# object path -> {"last": monotonic time last heard, "samples": readings since
+# the last snapshot, "rssi": last reading}. Only devices heard during this run
+# get an entry: BlueZ's cached RSSI from an earlier scan can be 30 s stale.
+heard = {}
+# Paths BlueZ has dropped. It removes temporary devices whenever a scan
+# stops, so every restart would look like everyone leaving; a removed
+# device is kept until it also falls silent for LOST_AFTER.
+removed = set()
+state = {"adapter": None, "was_off": None, "scanning": False, "stopping": False,
+         "restarter": None, "cycling": False, "tries": 0}
+RESTART_MS = 3000
+FAST_RESTART_MS = 1000
+# StartDiscovery retries (250 ms-1 s apart) before giving up: Bluetooth was
+# switched off under us, or the adapter is stuck.
+MAX_START_TRIES = 40
+
+
+def anon(address):
+    return hashlib.sha256(SALT + str(address).encode()).hexdigest()[:12]
+
+
+def short_uuid(uuid):
+    # 0000xxxx-0000-1000-8000-00805f9b34fb -> "xxxx"; custom uuids stay whole.
+    uuid = str(uuid).lower()
+    if uuid.startswith("0000") and uuid.endswith("-0000-1000-8000-00805f9b34fb"):
+        return uuid[4:8]
+    return uuid
+
+
+def device_json(props, rssi):
+    # "makers" keeps the first byte per company (Apple's message type), the
+    # quick clue; "mfr"/"svc" carry the whole payloads for Decode.js.
+    makers = {}
+    mfr = {}
+    for company, data in dict(props.get("ManufacturerData", {})).items():
+        makers[int(company)] = int(data[0]) if len(data) else -1
+        mfr[str(int(company))] = bytes(int(x) for x in data).hex()
+    svc = {short_uuid(u): bytes(int(x) for x in data).hex()
+           for u, data in dict(props.get("ServiceData", {})).items()}
+    out = {
+        "id": anon(props.get("Address", "")),
+        "classic": "Class" in props,
+        "class": int(props.get("Class", 0)),
+        "rssi": rssi,
+        "name": str(props.get("Name", "")),
+        "addrType": str(props.get("AddressType", "")),
+        "icon": str(props.get("Icon", "")),
+        "appearance": int(props.get("Appearance", 0)),
+        "makers": {str(k): v for k, v in makers.items()},
+        "uuids": sorted({short_uuid(u) for u in props.get("UUIDs", [])}
+                        | {short_uuid(u) for u in dict(props.get("ServiceData", {}))}),
+        "connected": bool(props.get("Connected", False)),
+        # Raw payloads for Decode.js; they stay in RAM like everything else.
+        "mfr": mfr,
+        "svc": svc,
+    }
+    flags = props.get("AdvertisingFlags")
+    if flags:
+        out["flags"] = int(flags[0])
+    # Only an address that stays put can be remembered: a public one, or a
+    # paired device's (BlueZ resolves its private addresses with the key it
+    # got when pairing).
+    paired = bool(props.get("Paired", False)) or bool(props.get("Bonded", False))
+    if paired:
+        out["paired"] = True
+    if LASTING_SALT and (paired or str(props.get("AddressType", "")) == "public"):
+        out["pkey"] = hashlib.sha256(LASTING_SALT + str(props.get("Address", "")).encode()).hexdigest()[:16]
+    if "TxPower" in props:
+        out["txPower"] = int(props["TxPower"])
+    return out
+
+
+def emit():
+    now = time.monotonic()
+    seen = []
+    for path, h in list(heard.items()):
+        age = now - h["last"]
+        if path not in devices or age > LOST_AFTER:
+            if age > LOST_AFTER * 4 or path not in devices or path in removed:
+                del heard[path]
+                if path in removed:
+                    removed.discard(path)
+                    devices.pop(path, None)
+            continue
+        samples, h["samples"] = h["samples"], []
+        d = device_json(devices[path], round(statistics.median(samples)) if samples else h["rssi"])
+        d.update({"peak": max(samples) if samples else h["rssi"], "n": len(samples), "age": round(age, 1)})
+        seen.append(d)
+    line = json.dumps({"powered": powered(state["adapter"]), "scanning": state["scanning"], "devices": seen})
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        stop()
+        return False
+    return True
+
+
+def hear(path, props, now=None):
+    """Something arrived from this device just now: note it, and keep the
+    reading if it carries one."""
+    h = heard.setdefault(path, {"last": 0.0, "samples": [], "rssi": None})
+    h["last"] = now or time.monotonic()
+    if "RSSI" in props and int(props["RSSI"]) not in NO_RSSI:
+        h["rssi"] = int(props["RSSI"])
+        h["samples"].append(h["rssi"])
+    if h["rssi"] is None:  # heard, but never with a reading: nothing to place
+        heard.pop(path)
+
+
+# Properties that change when an advert arrives. With DuplicateData,
+# ManufacturerData and ServiceData are re-sent with every advert, so they are
+# a heartbeat even when the RSSI stayed put.
+ADVERT_PROPS = ("RSSI", "ManufacturerData", "ServiceData", "TxPower")
+
+
+def on_added(path, interfaces):
+    if DEVICE in interfaces:
+        removed.discard(str(path))
+        devices[str(path)] = dict(interfaces[DEVICE])
+        if state["scanning"]:
+            hear(str(path), interfaces[DEVICE])
+
+
+def on_removed(path, interfaces):
+    if DEVICE in interfaces:
+        if str(path) in heard:
+            removed.add(str(path))
+        else:
+            devices.pop(str(path), None)
+    if ADAPTER in interfaces and state["adapter"] is not None and str(path) == state["adapter"].object_path:
+        fail("Bluetooth adapter went away")
+
+
+def on_device_changed(interface, changed, invalidated, path=None):
+    if path in devices:
+        devices[path].update(changed)
+        for key in invalidated:
+            devices[path].pop(key, None)
+        if any(key in changed for key in ADVERT_PROPS):
+            hear(path, changed)
+
+
+def on_adapter_changed(interface, changed, invalidated, path=None):
+    # BlueZ drops the scan on its own when bluetoothd restarts discovery
+    # badly, after suspend, or when the adapter blinks; ask for it again.
+    adapter = state["adapter"]
+    if adapter is None or path != adapter.object_path:
+        return
+    if "Discovering" in changed and not changed["Discovering"] and state["cycling"]:
+        state["cycling"] = False  # our own fast-mode stop, already restarted
+        return
+    if "Discovering" in changed and not changed["Discovering"] and state["scanning"] \
+            and not state["stopping"]:
+        state["scanning"] = False
+        GLib.timeout_add(1000, start_discovery)
+
+
+def on_owner_changed(name, old, new):
+    if name == BLUEZ and old and not new:
+        fail("Bluetooth service stopped")
+
+
+def find_adapter():
+    manager = dbus.Interface(bus.get_object(BLUEZ, "/"), OBJECTS)
+    adapter_path = None
+    for path, interfaces in manager.GetManagedObjects().items():
+        if ADAPTER in interfaces and adapter_path is None:
+            adapter_path = path
+        if DEVICE in interfaces:
+            devices[str(path)] = dict(interfaces[DEVICE])
+    if adapter_path is None:
+        fail("no Bluetooth adapter")
+    return bus.get_object(BLUEZ, adapter_path)
+
+
+def fail(message):
+    if state["adapter"] is not None and state["was_off"] and not state["stopping"]:
+        state["stopping"] = True
+        switch_off(state["adapter"], state["was_off"])
+    sys.stdout.write(json.dumps({"error": message}) + "\n")
+    sys.stdout.flush()
+    # Also called from D-Bus callbacks, where SystemExit would be swallowed.
+    os._exit(2)
+
+
+def marker():
+    """How an earlier, killed run found Bluetooth: "rfkill", "power" or ""."""
+    try:
+        with open(MARKER) as f:
+            return f.read().strip() or "power"
+    except OSError:
+        return ""
+
+
+def mark(how):
+    if not MARKER:
+        return
+    if how:
+        os.makedirs(os.path.dirname(MARKER), mode=0o700, exist_ok=True)
+        with open(MARKER, "w") as f:
+            f.write(how)
+    elif os.path.exists(MARKER):
+        os.remove(MARKER)
+
+
+def soft_blocked():
+    """True when an rfkill soft block holds a Bluetooth radio down."""
+    base = "/sys/class/rfkill"
+    try:
+        for entry in os.listdir(base):
+            with open(os.path.join(base, entry, "type")) as f:
+                if f.read().strip() != "bluetooth":
+                    continue
+            with open(os.path.join(base, entry, "soft")) as f:
+                if f.read().strip() == "1":
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def rfkill(op):
+    # /dev/rfkill is the logged-in user's (uaccess), so no root is needed.
+    try:
+        return subprocess.run([RFKILL, op, "bluetooth"], timeout=5,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def powered(adapter):
+    try:
+        return bool(adapter.Get(ADAPTER, "Powered", dbus_interface=PROPS))
+    except dbus.DBusException:
+        return False
+
+
+def switch_off(adapter, how):
+    """Put Bluetooth back the way it was found."""
+    if how == "rfkill":
+        if not rfkill("block"):
+            return False
+    else:
+        try:
+            set_powered(adapter, False)
+        except dbus.DBusException:
+            return False
+    mark("")
+    return True
+
+
+def set_powered(adapter, on, tries=3):
+    """The kernel sometimes refuses a power change once ("Failed (0x03)") while
+    the controller is still settling; a short retry gets through."""
+    for attempt in range(tries):
+        try:
+            adapter.Set(ADAPTER, "Powered", dbus.Boolean(on), dbus_interface=PROPS)
+            return
+        except dbus.DBusException:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.5)
+
+
+def restore():
+    """Switch Bluetooth off if a killed run left it on for us."""
+    how = marker()
+    if not how:
+        return 0
+    # On failure the marker stays, so the next run or restore tries again.
+    switch_off(find_adapter() if how == "power" else None, how)
+    return 0
+
+
+def set_transport(transport):
+    """LE only, or "auto" (LE plus classic inquiry). BlueZ applies a new
+    filter to a running scan, so this can be changed on the fly.
+
+    RSSI -127 drops nothing, but any RSSI in the filter makes BlueZ report
+    every reading; without one it only reports changes of 8 dBm or more
+    (RSSI_THRESHOLD in src/device.c), far too coarse to range by."""
+    adapter = state["adapter"]
+    if adapter is None:
+        return
+    try:
+        dbus.Interface(adapter, ADAPTER).SetDiscoveryFilter(
+            {"Transport": transport, "DuplicateData": dbus.Boolean(True), "RSSI": dbus.Int16(-127)})
+    except dbus.DBusException:
+        pass
+
+
+def restart_scan():
+    """A stop and start resets the controller's duplicate filter."""
+    if state["stopping"] or not state["scanning"]:
+        return True
+    scanner = dbus.Interface(state["adapter"], ADAPTER)
+    state["cycling"] = True
+    try:
+        scanner.StopDiscovery()
+        scanner.StartDiscovery()
+    except dbus.DBusException:
+        state["scanning"] = False
+        GLib.timeout_add(250, start_discovery)
+    # The Discovering=false from our own stop arrives after this returns and
+    # clears the flag (on_adapter_changed); BlueZ may also skip it when the
+    # stop and start coalesce, so a late fallback clears it too.
+    GLib.timeout_add(FAST_RESTART_MS - 100, lambda: state.update(cycling=False) or False)
+    return True
+
+
+def set_fast(on):
+    """Restart every second (fast) or every RESTART_MS (census)."""
+    if state["restarter"] is not None:
+        GLib.source_remove(state["restarter"])
+    state["restarter"] = GLib.timeout_add(FAST_RESTART_MS if on else RESTART_MS, restart_scan)
+
+
+def on_stdin(fd, condition):
+    data = os.read(fd, 256)
+    if not data:  # the shell closed our stdin: nothing left to report to
+        stop()
+        return False
+    for line in data.decode(errors="replace").splitlines():
+        if line.strip() == "classic on":
+            set_transport("auto")
+        elif line.strip() == "classic off":
+            set_transport("le")
+        elif line.strip() == "fast on":
+            set_fast(True)
+        elif line.strip() == "fast off":
+            set_fast(False)
+    return True
+
+
+def start():
+    adapter = state["adapter"] = find_adapter()
+    # A marker means an earlier run switched Bluetooth on and was killed
+    # before it could switch it back: its real resting state is that one.
+    how = marker()
+    if not how and soft_blocked():
+        how = "rfkill"
+    elif not how and not powered(adapter):
+        how = "power"
+    state["was_off"] = how or None
+    if how:
+        mark(how)
+        if how == "rfkill" and soft_blocked() and not rfkill("unblock"):
+            state["was_off"] = None
+            mark("")
+            fail("cannot turn Bluetooth on (rfkill)")
+        # With the block gone bluetoothd powers up by itself (AutoEnable);
+        # asking as well covers an adapter that was merely powered down.
+        try:
+            if not powered(adapter):
+                time.sleep(0.5)
+            if not powered(adapter):
+                set_powered(adapter, True)
+        except dbus.DBusException as e:
+            fail("cannot power on Bluetooth: " + e.get_dbus_message())
+    set_transport("auto" if "--classic" in sys.argv[1:] else "le")
+    if start_discovery():
+        GLib.timeout_add(250, start_discovery)
+
+
+def start_discovery():
+    """Returns True while BlueZ isn't ready yet, so a GLib timer retries it.
+    Powering on takes a moment; BlueZ answers NotReady until it is done."""
+    if state["stopping"]:
+        return False
+    state["tries"] += 1
+    if state["tries"] > MAX_START_TRIES:
+        fail("Bluetooth went off" if not powered(state["adapter"]) else "cannot restart scan")
+    try:
+        dbus.Interface(state["adapter"], ADAPTER).StartDiscovery()
+        state["scanning"] = True
+        state["tries"] = 0
+        return False
+    except dbus.DBusException as e:
+        if "InProgress" in e.get_dbus_name():  # already ours and running
+            state["scanning"] = True
+            state["tries"] = 0
+            return False
+        if "NotReady" in e.get_dbus_name():
+            return True
+        if "Busy" in e.get_dbus_name() or "Failed" in e.get_dbus_name():
+            return True  # mid-restart after suspend; try again shortly
+        fail("cannot start scan: " + e.get_dbus_message())
+
+
+def stop(*_):
+    state["stopping"] = True
+    adapter = state["adapter"]
+    if adapter is not None:
+        try:
+            if state["scanning"]:
+                dbus.Interface(adapter, ADAPTER).StopDiscovery()
+        except dbus.DBusException:
+            pass
+        if state["was_off"]:
+            switch_off(adapter, state["was_off"])
+    loop.quit()
+
+
+if sys.argv[1:] == ["--restore"]:
+    sys.exit(restore())
+
+# Die with the shell instead of outliving it with the adapter on.
+ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+if os.getppid() == 1:
+    sys.exit(0)
+
+bus.add_signal_receiver(on_added, "InterfacesAdded", OBJECTS, BLUEZ)
+bus.add_signal_receiver(on_removed, "InterfacesRemoved", OBJECTS, BLUEZ)
+# arg0 matching lets the bus drop other interfaces' changes before they wake us.
+bus.add_signal_receiver(on_device_changed, "PropertiesChanged", PROPS, BLUEZ, path_keyword="path", arg0=DEVICE)
+bus.add_signal_receiver(on_adapter_changed, "PropertiesChanged", PROPS, BLUEZ, path_keyword="path", arg0=ADAPTER)
+bus.add_signal_receiver(on_owner_changed, "NameOwnerChanged", "org.freedesktop.DBus", "org.freedesktop.DBus", arg0=BLUEZ)
+
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal_add(GLib.PRIORITY_HIGH, sig, lambda: stop() or False)
+
+start()
+set_fast(False)
+GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP, on_stdin)
+GLib.timeout_add_seconds(1, emit)
+loop.run()

@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "id": "m.radar",
+  "name": "Radar",
+  "version": "1.0.0",
+  "author": "Mar",
+  "license": "MIT",
+  "description": "A radar of the Bluetooth devices and Wi-Fi networks around you: device icons, find a lost device hot/cold, tracker and camera-glasses alerts, proximity lock. Listens only, keeps nothing.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Radar",
+    "description": "Nearby Bluetooth devices and Wi-Fi networks. Click to open, right-click to start or stop scanning.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "autoStopMinutes": 5,
+      "maxRangeMeters": 10,
+      "classicScan": true,
+      "showWifi": true,
+      "rangeFilter": 0,
+      "hideUnknown": false,
+      "guard": false
+    },
+    "schema": [
+      {
+        "key": "autoStopMinutes",
+        "type": "integer",
+        "label": "Stop scanning after (minutes)",
+        "min": 0,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "Scanning stops on its own after this long, to spare battery and Bluetooth audio. 0 keeps scanning until you switch it off."
+      },
+      {
+        "key": "maxRangeMeters",
+        "type": "integer",
+        "label": "Radar range (metres)",
+        "min": 3,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "Distance at the radar's outer ring. Anything farther sits on the rim."
+      },
+      {
+        "key": "classicScan",
+        "type": "boolean",
+        "label": "Classic Bluetooth",
+        "defaultValue": true,
+        "description": "Also find classic Bluetooth devices (speakers, car kits, some phones) that are in discoverable mode. Can make Bluetooth audio stutter while scanning. Toggle with B in the radar."
+      },
+      {
+        "key": "showWifi",
+        "type": "boolean",
+        "label": "Wi-Fi networks",
+        "defaultValue": true,
+        "description": "Show nearby Wi-Fi networks on the radar. Toggle with W in the radar."
+      },
+      {
+        "key": "rangeFilter",
+        "type": "integer",
+        "label": "Only show devices within (metres)",
+        "min": 0,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 0,
+        "description": "Hide devices estimated farther than this. 0 shows everything. Cycle all / 10 m / 3 m with F in the radar."
+      },
+      {
+        "key": "hideUnknown",
+        "type": "boolean",
+        "label": "Hide unidentified devices",
+        "defaultValue": false,
+        "description": "Hide devices that send neither a name nor anything recognisable. Toggle with U in the radar."
+      },
+      {
+        "key": "guard",
+        "type": "boolean",
+        "label": "Guard",
+        "defaultValue": false,
+        "description": "Warn when a tracker away from its owner (AirTag, SmartTag, Tile…) stays near you for 30+ minutes, or camera glasses (Ray-Ban/Oakley Meta…) are close. Scans 20 s every 2 min while the radar is off. Toggle with G in the radar."
+      }
+    ]
+  }
+}
